@@ -9,10 +9,15 @@ Features:
 - Generate subtitles (SRT)
 - Optionally dub audio using gTTS + pydub
 - Burn subtitles back into video (ffmpeg)
-- Simple Streamlit web UI for public use
+- Streamlit web UI:
+    - Upload video
+    - OR paste YouTube link (public videos only, no cookies)
+    - Choose source / target language
+    - Choose subtitles or dubbed
+    - Download final translated video
 
 Notes:
-- Requires: ffmpeg (system), whisper, deep-translator, gTTS, pydub, streamlit
+- Requires: ffmpeg (system), whisper, deep-translator, gTTS, pydub, yt-dlp, streamlit
 - Long videos will take time and require good CPU/RAM
 - Only process videos you have rights to use.
 """
@@ -23,7 +28,6 @@ import subprocess
 import tempfile
 import math
 import sys
-from pathlib import Path
 from typing import List, Optional
 
 # Optional Streamlit import (only required for the web UI)
@@ -32,7 +36,7 @@ try:
 except Exception:
     st = None
 
-# Lazy imports: keep original try/excepts so missing optional deps don't break simple runs/tests
+# Lazy imports for heavy/optional deps
 try:
     import whisper
 except Exception:
@@ -49,14 +53,18 @@ except Exception:
     gTTS = None
 
 try:
-    import pysrt
-except Exception:
-    pysrt = None
-
-try:
     from pydub import AudioSegment
 except Exception:
     AudioSegment = None
+
+# YouTube downloader (optional, for online translation)
+try:
+    import yt_dlp
+except Exception:
+    yt_dlp = None
+
+
+# ------------------- Core helpers -------------------
 
 
 def run_cmd(cmd: List[str]):
@@ -236,7 +244,9 @@ def chunk_segments_for_memory(
     return chunks
 
 
-# ---------- Argument parsing helpers ----------
+# ------------------- CLI argument helpers -------------------
+
+
 def get_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Video Translator - extract audio, transcribe, translate and optionally dub or burn subtitles."
@@ -334,7 +344,9 @@ def run_pipeline(args: argparse.Namespace):
         print("Dubbed output saved to", args.out)
 
 
-# ---------- Simple unit tests (do not require heavy deps) ----------
+# ------------------- Lightweight tests -------------------
+
+
 def _test_arg_parsing_ok():
     argv = [
         "--input",
@@ -397,14 +409,18 @@ def main(argv: Optional[List[str]] = None) -> int:
     return 0
 
 
-# ---------- Streamlit web UI (Upload-only, public safe) ----------
+# ------------------- Streamlit web UI (Upload + YouTube) -------------------
+
 
 def run_streamlit_app():
     if st is None:
         raise RuntimeError("streamlit not installed. Run: pip install streamlit")
 
-    # Page config MUST be first Streamlit call
-    st.set_page_config(page_title="Rayvia AI – Video Translator", layout="wide")
+    # page config should be first Streamlit call
+    st.set_page_config(
+        page_title="Rayvia AI – Video Translator",
+        layout="wide",
+    )
 
     st.markdown(
         """
@@ -412,7 +428,7 @@ def run_streamlit_app():
         Rayvia AI – Video Translator & Dubbing Tool
     </h2>
     <p style="text-align:center; font-size:14px;">
-        Upload a video → Choose languages → Translate → Download<br>
+        Upload a video <b>or</b> paste a YouTube link → Choose languages → Translate → Download<br>
         Supports long videos, subtitles & simple dubbing (quality depends on server power).
     </p>
     <hr>
@@ -420,12 +436,91 @@ def run_streamlit_app():
         unsafe_allow_html=True,
     )
 
-    st.subheader("📤 Upload Video File")
-    uploaded = st.file_uploader(
-        "Upload video file",
-        type=["mp4", "mov", "mkv", "avi", "mpeg4"],
-        help="Max file size depends on server limits.",
-    )
+    if "video_path" not in st.session_state:
+        st.session_state.video_path = None
+        st.session_state.video_label = None
+
+    tab_upload, tab_yt = st.tabs(["📤 Upload Video", "🔗 YouTube (online)"])
+
+    # -------- Tab 1: Upload video --------
+    with tab_upload:
+        st.subheader("Upload from your device")
+        uploaded = st.file_uploader(
+            "Upload video file",
+            type=["mp4", "mov", "mkv", "avi", "mpeg4"],
+            help="Max file size depends on server limits.",
+            key="uploaded_file",
+        )
+
+        if uploaded is not None:
+            tmpdir = tempfile.mkdtemp(prefix="rayvia_upload_")
+            in_path = os.path.join(tmpdir, uploaded.name)
+            with open(in_path, "wb") as f:
+                f.write(uploaded.getbuffer())
+            st.session_state.video_path = in_path
+            st.session_state.video_label = f"Uploaded: {uploaded.name}"
+            st.success(f"Video uploaded: {uploaded.name}")
+
+    # -------- Tab 2: YouTube video --------
+    with tab_yt:
+        st.subheader("Use a public YouTube video (no cookies, public only)")
+        yt_url = st.text_input(
+            "YouTube URL",
+            placeholder="https://www.youtube.com/watch?v=...",
+            key="yt_url",
+        )
+
+        if yt_dlp is None:
+            st.info(
+                "YouTube mode is disabled because yt-dlp is not installed on the server."
+            )
+        else:
+            if st.button("Fetch video from YouTube", key="yt_fetch"):
+                if not yt_url.strip():
+                    st.warning("Please paste a YouTube URL first.")
+                else:
+                    try:
+                        st.info("Downloading video from YouTube… please wait…")
+                        tmpdir = tempfile.mkdtemp(prefix="rayvia_yt_")
+                        ydl_opts = {
+                            "outtmpl": os.path.join(tmpdir, "video.%(ext)s"),
+                            "format": "bestvideo+bestaudio/best",
+                            # no cookies: only public, non-age-restricted videos
+                        }
+                        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                            ydl.download([yt_url])
+
+                        video_path = None
+                        for fname in os.listdir(tmpdir):
+                            if fname.lower().endswith(
+                                (".mp4", ".mkv", ".mov", ".avi")
+                            ):
+                                video_path = os.path.join(tmpdir, fname)
+                                break
+
+                        if video_path:
+                            st.session_state.video_path = video_path
+                            st.session_state.video_label = f"YouTube video: {os.path.basename(video_path)}"
+                            st.success("YouTube video downloaded and ready for translation.")
+                        else:
+                            st.error(
+                                "Could not find a downloadable video file. "
+                                "This video may be restricted. Try another URL."
+                            )
+                    except Exception as e:
+                        st.error(
+                            f"Error downloading from YouTube: {e}\n\n"
+                            "This usually happens for age-restricted, login-required or region-blocked videos."
+                        )
+
+    st.markdown("---")
+
+    # -------- Common settings & translation --------
+    if not st.session_state.video_path:
+        st.warning("Please upload a video or fetch one from YouTube above.")
+        return
+
+    st.success(f"Current video source: {st.session_state.video_label}")
 
     colA, colB = st.columns(2)
 
@@ -447,49 +542,42 @@ def run_streamlit_app():
             index=2,
         )
 
-    if uploaded is not None:
-        tmpdir = tempfile.mkdtemp(prefix="rayvia_upload_")
-        in_path = os.path.join(tmpdir, uploaded.name)
-
-        with open(in_path, "wb") as f:
-            f.write(uploaded.getbuffer())
-
-        st.success(f"Video uploaded: {uploaded.name}")
-
-        if st.button("🚀 Start Translation"):
-            with st.spinner("Processing… this may take time for long videos…"):
-                out_path = os.path.join(
-                    tmpdir, f"output_{tgt_lang}_{uploaded.name}"
-                )
-                args = argparse.Namespace(
-                    input=in_path,
-                    source_lang=src_lang,
-                    target_lang=tgt_lang,
-                    out=out_path,
-                    mode=mode,
-                    whisper_model=whisper_model,
-                )
-                try:
-                    if not validate_args(args):
-                        st.error(
-                            "Validation failed. Check that the input file exists and try again."
-                        )
+    if st.button("🚀 Start Translation"):
+        with st.spinner("Processing… this may take time for long videos…"):
+            tmpdir_out = tempfile.mkdtemp(prefix="rayvia_out_")
+            out_path = os.path.join(
+                tmpdir_out, f"output_{tgt_lang}.mp4"
+            )
+            args = argparse.Namespace(
+                input=st.session_state.video_path,
+                source_lang=src_lang,
+                target_lang=tgt_lang,
+                out=out_path,
+                mode=mode,
+                whisper_model=whisper_model,
+            )
+            try:
+                if not validate_args(args):
+                    st.error(
+                        "Validation failed. Check that the input file exists and try again."
+                    )
+                else:
+                    run_pipeline(args)
+                    if os.path.exists(args.out):
+                        st.success("🎉 Translation complete!")
+                        with open(args.out, "rb") as f:
+                            st.download_button(
+                                "Download translated video",
+                                f,
+                                file_name=os.path.basename(args.out),
+                            )
                     else:
-                        run_pipeline(args)
-                        if os.path.exists(args.out):
-                            st.success("🎉 Translation complete!")
-                            with open(args.out, "rb") as f:
-                                st.download_button(
-                                    "Download translated video",
-                                    f,
-                                    file_name=os.path.basename(args.out),
-                                )
-                        else:
-                            st.error("Output file not found. Something went wrong.")
-                except Exception as e:
-                    st.error(f"Pipeline error: {e}")
-    else:
-        st.info("Please upload a video to start.")
+                        st.error("Output file not found. Something went wrong.")
+            except Exception as e:
+                st.error(f"Pipeline error: {e}")
+
+
+# ------------------- Entrypoint -------------------
 
 
 if __name__ == "__main__":
